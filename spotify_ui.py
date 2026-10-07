@@ -1,7 +1,7 @@
-"""读取 Spotify 播放栏里「歌词」按钮（麦克风图标）的开关状态。
+"""Read the on/off state of the lyrics button (microphone icon) in Spotify's playback bar.
 
-Spotify 是 Chromium 做的，会通过 UI Automation（读屏软件用的接口）暴露界面，
-歌词按钮在里面是一个带开关状态（ToggleState）的按钮。
+Spotify is built on Chromium, which exposes its UI through UI Automation (the API screen readers use);
+the lyrics button shows up there as a button with a toggle state.
 """
 from __future__ import annotations
 
@@ -14,14 +14,15 @@ from ctypes import wintypes
 
 log = logging.getLogger(__name__)
 
-BUTTON_NAMES = ["歌词", "歌詞", "Lyrics", "가사", "Letra", "Paroles", "Songtext", "Testo"]  # 各语言界面
+# the button's name in Spotify's UI languages
+BUTTON_NAMES = ["Lyrics", "歌词", "歌詞", "가사", "Letra", "Paroles", "Songtext", "Testo"]
 TREE_SCOPE_DESCENDANTS = 4
 UIA_NAME = 30005
 UIA_CONTROL_TYPE = 30003
 UIA_BUTTON = 50000
 UIA_IS_TOGGLE_AVAILABLE = 30041
 UIA_TOGGLE_STATE = 30086
-MISSING_AFTER = 8  # 秒：Spotify 开着却一直找不到按钮，就认为这个功能用不了
+MISSING_AFTER = 8  # seconds: if Spotify is open but the button can't be found for this long, give up on it
 
 _k32 = ctypes.WinDLL("kernel32")
 _k32.OpenProcess.restype = wintypes.HANDLE
@@ -46,8 +47,8 @@ def _exe_name(pid: int) -> str:
 
 
 class LyricsButtonWatcher(threading.Thread):
-    """定时读按钮状态，变化时回调 on_change：
-    "on" / "off"：按钮开着 / 关着；"pending"：Spotify 没开，还不知道；"missing"：找不到按钮。
+    """Polls the button and calls on_change when its state changes:
+    "on" / "off": the button is on / off; "pending": Spotify isn't open yet; "missing": button not found.
     """
 
     def __init__(self, on_change, spotify_running, interval: float = 0.4):
@@ -60,11 +61,12 @@ class LyricsButtonWatcher(threading.Thread):
     def _emit(self, state: str):
         if state != self._state:
             self._state = state
-            log.info("Spotify 歌词按钮：%s", state)
+            log.info("Spotify lyrics button: %s", state)
             self._on_change(state)
 
     def run(self):
-        # 这个库导入时会设置进程的 DPI 模式，放到这里（Qt 已经初始化完）就不会覆盖 Qt 的设置
+        # uiautomation sets the process DPI awareness on import; importing it here, after Qt has
+        # initialized, keeps it from overriding Qt's setting
         import uiautomation as auto
 
         with auto.UIAutomationInitializerInThread():
@@ -90,14 +92,15 @@ class LyricsButtonWatcher(threading.Thread):
                     if win is not None:
                         state = self._read(win.Element, cond)
                 except Exception:
-                    log.debug("读取歌词按钮失败", exc_info=True)
+                    log.debug("Failed to read the lyrics button", exc_info=True)
                 if state is None:
-                    win = None  # 窗口可能换了，下次重新找
+                    win = None  # the window may have changed; look it up again next time
                     if time.monotonic() - last_found > MISSING_AFTER:
                         self._emit("missing")
                     continue
                 last_found = time.monotonic()
-                # 按钮重新渲染的瞬间状态可能不准，连续两次读到一样的才算数
+                # the state can be off for a moment while the button re-renders,
+                # so only trust it after two identical reads
                 if state == prev_read:
                     self._emit(state)
                 prev_read = state

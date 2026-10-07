@@ -1,4 +1,5 @@
-"""从 Windows 系统媒体控件（SMTC）读取 Spotify 的当前曲目和播放进度，也用它来控制播放。"""
+"""Read Spotify's current track and playback position from Windows' media controls (SMTC),
+and use them to control playback."""
 from __future__ import annotations
 
 import asyncio
@@ -21,16 +22,16 @@ class Track:
     title: str
     artist: str
     album: str
-    duration: float  # 秒，未知时为 0
+    duration: float  # seconds, 0 if unknown
 
 
 @dataclass(frozen=True)
 class Snapshot:
     track: Track | None
-    position: float    # sampled_at 那一刻的播放进度（秒）
+    position: float    # playback position (seconds) at sampled_at
     sampled_at: float  # time.monotonic()
     playing: bool
-    running: bool      # Spotify 进程是否在运行
+    running: bool      # whether the Spotify process is running
 
 
 class _PROCESSENTRY32W(ctypes.Structure):
@@ -72,7 +73,7 @@ def press_media_key(command: str):
 
 
 class MediaWatcher(threading.Thread):
-    """后台轮询 SMTC，每次采样都把一个 Snapshot 交给 on_update。"""
+    """Polls SMTC in the background and hands every sample to on_update as a Snapshot."""
 
     def __init__(self, on_update, app_id: str = "spotify", exe: str = "spotify.exe",
                  interval: float = 0.25, debug: bool = False):
@@ -93,16 +94,16 @@ class MediaWatcher(threading.Thread):
             try:
                 asyncio.run(self._main())
             except Exception:
-                log.exception("SMTC 读取出错，3 秒后重试")
+                log.exception("SMTC error, retrying in 3 s")
                 self._on_update(Snapshot(None, 0.0, time.monotonic(), False, self._running))
                 time.sleep(3)
 
     def send(self, command: str):
-        """从任意线程发播放控制命令：toggle / next / prev。"""
+        """Send a playback command from any thread: toggle / next / prev."""
         if self._loop and self._session is not None:
             asyncio.run_coroutine_threadsafe(self._command(command), self._loop)
         else:
-            # 刚打开 Spotify、还没播过的时候它没有 SMTC 会话，只能发系统媒体键
+            # right after Spotify starts it has no SMTC session yet, so fall back to media keys
             press_media_key(command)
 
     async def _command(self, command: str):
@@ -112,13 +113,13 @@ class MediaWatcher(threading.Thread):
         try:
             await op()
         except Exception:
-            log.exception("播放控制失败：%s", command)
+            log.exception("Playback command failed: %s", command)
         await asyncio.sleep(0.15)
-        self._wake.set()  # 马上重新采样，让界面尽快跟上
+        self._wake.set()  # sample again right away so the UI catches up quickly
 
     async def _main(self):
-        # 在这个线程里才导入 winrt：它导入时会把当前线程初始化成 MTA，
-        # 放在主线程会和 Qt 需要的 STA 冲突。
+        # Import winrt only in this thread: importing it initializes the current thread as MTA,
+        # which would clash with the STA that Qt needs on the main thread.
         from winrt.windows.media.control import (
             GlobalSystemMediaTransportControlsSessionManager as Manager,
         )
@@ -134,7 +135,7 @@ class MediaWatcher(threading.Thread):
             snap = await self._sample(manager)
             self._on_update(snap)
             try:
-                # Spotify 没开时不用采得那么勤
+                # no need to poll as often while Spotify is closed
                 await asyncio.wait_for(self._wake.wait(), self._interval if self._running else 2)
             except asyncio.TimeoutError:
                 pass
@@ -156,8 +157,8 @@ class MediaWatcher(threading.Thread):
         tl = session.get_timeline_properties()
         playing = session.get_playback_info().playback_status == PLAYING
 
-        # Spotify 只在播放/暂停/拖动时才更新 position，
-        # 播放中要用 last_updated_time 推算出现在的进度。
+        # Spotify only updates `position` on play / pause / seek,
+        # so while playing we extrapolate from last_updated_time.
         raw = tl.position.total_seconds()
         pos = raw
         last = tl.last_updated_time

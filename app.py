@@ -1,4 +1,4 @@
-"""Spotify 桌面歌词浮窗。用 pythonw app.py 启动，加 --debug 记录详细日志。"""
+"""Desktop lyrics overlay for Spotify. Run with `pythonw app.py`; add --debug for detailed logs."""
 from __future__ import annotations
 
 import ctypes
@@ -11,36 +11,40 @@ import time
 import winreg
 from concurrent.futures import Future, ThreadPoolExecutor
 from ctypes import wintypes
+from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetricsF, QGuiApplication, QIcon, QPainter,
-                           QPainterPath, QPen, QPixmap)
+from PySide6.QtGui import (QActionGroup, QColor, QCursor, QFont, QFontMetricsF, QGuiApplication, QIcon,
+                           QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QFontDialog, QMenu, QSystemTrayIcon, QToolTip,
                                QWidget)
 
+import i18n
 import lyrics as lyr
+from i18n import tr
 from media import MediaWatcher, Snapshot, Track
 from spotify_ui import LyricsButtonWatcher
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 ROOT = Path(__file__).resolve().parent
-FROZEN = getattr(sys, "frozen", False)  # PyInstaller 打包后的 exe
-DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyLyrics"  # 设置、歌词缓存、日志
+FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
+DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyLyrics"  # settings, lyrics cache, log
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "SpotifyLyrics"
 SPOTIFY_EXE = Path(os.environ.get("APPDATA", "")) / "Spotify" / "Spotify.exe"
 log = logging.getLogger("app")
 
 DEFAULTS = {
+    "language": "en",
     "x": None, "y": None, "width": 300,
     "font_family": "Microsoft YaHei UI", "font_size": 30,
     "color": "#ffffff", "highlight": "#1ed760",
     "locked": False, "second_line": True, "translation": True,
-    "follow_button": True,  # 跟随 Spotify 自带的歌词按钮显示 / 隐藏
-    "offsets": {},     # 每首歌的时间偏移（秒），正数表示歌词提前
-    "tips_shown": [],  # 只提示一次的气泡
+    "follow_button": True,  # show / hide together with Spotify's own lyrics button
+    "offsets": {},     # per-song timing offset in seconds; positive = lyrics earlier
+    "tips_shown": [],  # one-time tray tips that were already shown
 }
 
 _u32 = ctypes.WinDLL("user32")
@@ -60,7 +64,7 @@ class Settings(dict):
             try:
                 self.update(json.loads(path.read_text("utf-8")))
             except Exception:
-                log.exception("设置文件读取失败，用默认设置")
+                log.exception("Couldn't read settings, using defaults")
 
     def save(self):
         tmp = self.path.with_suffix(".tmp")
@@ -69,7 +73,7 @@ class Settings(dict):
 
 
 def _sing_seconds(text: str) -> float:
-    """粗估一句歌词要唱多久，用来控制逐字高亮的速度。"""
+    """Rough guess of how long a line takes to sing; sets the speed of the highlight sweep."""
     cjk = len(lyr.CJK.findall(text))
     other = len(re.sub(r"\s", "", text)) - cjk
     return 1.0 + 0.45 * cjk + 0.07 * other
@@ -77,26 +81,28 @@ def _sing_seconds(text: str) -> float:
 
 class LyricsApp(QObject):
     snapshot = Signal(object)
-    fetched = Signal(str, object, bool)  # key, Lyrics | None, 是否正常完成
-    button_state = Signal(str)           # Spotify 歌词按钮：on / off / pending / missing
+    fetched = Signal(str, object, bool)  # key, Lyrics | None, finished without error
+    button_state = Signal(str)           # Spotify's lyrics button: on / off / pending / missing
 
     def __init__(self, debug: bool = False):
         super().__init__()
         self.settings = Settings(DATA / "settings.json")
+        i18n.set_language(self.settings["language"])
         self.track: Track | None = None
         self.key = ""
         self.lyrics: lyr.Lyrics | None = None
         self.status = "idle"  # idle | skip | loading | ok | none | error
         self.pos, self.mono, self.playing = 0.0, time.monotonic(), False
-        # 浮窗跟着 Spotify 和它的歌词按钮出现、消失；用户手动隐藏后，
-        # 等歌词按钮下次被点、或 Spotify 下次打开时再自动出来
+        # The overlay comes and goes with Spotify and its lyrics button. After the user hides it,
+        # it comes back the next time the lyrics button is clicked or Spotify is started.
         self.running = False
         self.lyrics_btn = "pending"
         self.hidden_by_user = False
         self.force_show = False
 
         self.pool = ThreadPoolExecutor(max_workers=2)
-        # 换歌后稍等一下再搜：时长信息会晚一点到，快速切歌时也不会每首都去搜
+        # Wait a moment after a track change before searching: the duration arrives a bit later,
+        # and skipping quickly through tracks won't trigger a search for each one.
         self.fetch_timer = QTimer(self, singleShot=True, interval=600, timeout=self.fetch)
         self.snapshot.connect(self._on_snapshot)
         self.fetched.connect(self._on_fetched)
@@ -105,27 +111,31 @@ class LyricsApp(QObject):
         self.menu = self._build_menu()
         self.overlay = Overlay(self)
         self.tray = QSystemTrayIcon(_make_icon(), self)
-        self.tray.setToolTip("Spotify 歌词")
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._on_tray)
+        self._update_tooltip()
         self.tray.show()
         if self.settings.first_run:
             self.settings.save()
-            self.tip("welcome", "歌词会在 Spotify 打开时自动出现。鼠标移到歌词上会出现控制按钮。")
+            self.tip("welcome", "tip_welcome")
 
         self.watcher = MediaWatcher(self.snapshot.emit, debug=debug)
         self.watcher.start()
         LyricsButtonWatcher(self.button_state.emit, lambda: self.running).start()
 
-    def tip(self, name: str, text: str):
-        """同一条提示只弹一次。"""
+    def tip(self, name: str, key: str):
+        """Show a tray tip, but only once ever."""
         if name in self.settings["tips_shown"]:
             return
         self.settings["tips_shown"].append(name)
         self.settings.save()
-        self.tray.showMessage("Spotify 歌词", text, QSystemTrayIcon.MessageIcon.Information, 6000)
+        self.tray.showMessage(tr("app_name"), tr(key), QSystemTrayIcon.MessageIcon.Information, 6000)
 
-    # ------------------------------------------------------------ 播放状态
+    def _update_tooltip(self):
+        t = self.track
+        self.tray.setToolTip(f"{tr('app_name')}\n{t.title} - {t.artist}" if t else tr("app_name"))
+
+    # ------------------------------------------------------------ playback state
 
     def offset(self) -> float:
         return float(self.settings["offsets"].get(self.key, 0.0))
@@ -149,44 +159,44 @@ class LyricsApp(QObject):
         track = snap.track
         key = lyr.track_key(track) if track else ""
         if key == self.key:
-            self.track = track  # 时长可能刚更新
+            self.track = track  # the duration may have just arrived
             return
         self.key, self.track, self.lyrics = key, track, None
         if not track:
             self.status = "idle"
         elif not track.artist:
-            self.status = "skip"  # 广告之类没有歌手的
+            self.status = "skip"  # ads and the like have no artist
         else:
             self.status = "loading"
             self.fetch_timer.start()
-        self.tray.setToolTip(f"Spotify 歌词\n{track.title} - {track.artist}" if track else "Spotify 歌词")
+        self._update_tooltip()
 
     def _on_button(self, state: str):
         prev, self.lyrics_btn = self.lyrics_btn, state
         if {prev, state} == {"on", "off"}:
-            self.hidden_by_user = self.force_show = False  # 用户点了 Spotify 的歌词按钮，以它为准
+            self.hidden_by_user = self.force_show = False  # the user clicked Spotify's button; follow it
         if state == "off" and self.settings["follow_button"]:
-            self.tip("follow", "点 Spotify 播放栏里的「歌词」按钮（麦克风图标）就会显示桌面歌词，再点一次隐藏。")
+            self.tip("follow", "tip_follow")
         self.sync_visibility()
 
     def sync_visibility(self):
-        # 找不到歌词按钮（missing）时退回到「Spotify 开着就显示」
+        # if the lyrics button can't be found ("missing"), fall back to "show while Spotify is open"
         follow_ok = not self.settings["follow_button"] or self.lyrics_btn in ("on", "missing")
         want = not self.hidden_by_user and (self.force_show or (self.running and follow_ok))
         if want != self.overlay.isVisible():
             self.overlay.setVisible(want)
 
     def control(self, command: str):
-        """播放控制：toggle / next / prev。"""
+        """Playback control: toggle / next / prev."""
         if command == "toggle" and self.track:
-            # 先按预期把图标翻过来，下一次采样会校正
+            # flip the icon right away; the next sample will correct it if needed
             self.pos, self.mono, self.playing = self.raw_position(), time.monotonic(), not self.playing
         self.watcher.send(command)
 
     def hide_overlay(self):
         self.hidden_by_user = True
         self.sync_visibility()
-        self.tip("hidden", "歌词已隐藏。单击托盘图标可以重新显示，下次打开 Spotify 也会自动出现。")
+        self.tip("hidden", "tip_hidden")
 
     def fetch(self, use_cache: bool = True):
         track, key = self.track, self.key
@@ -199,19 +209,19 @@ class LyricsApp(QObject):
             try:
                 self.fetched.emit(key, f.result(), True)
             except Exception:
-                log.exception("歌词获取失败")
+                log.exception("Lyrics lookup failed")
                 self.fetched.emit(key, None, False)
 
         fut.add_done_callback(done)
 
     def _on_fetched(self, key: str, lyrics, ok: bool):
         if key != self.key:
-            return  # 已经切到别的歌了
+            return  # the track has changed in the meantime
         self.lyrics = lyrics
         self.status = "ok" if lyrics else "none" if ok else "error"
 
     def view(self) -> tuple[str, float | None, str, bool] | None:
-        """当前要显示的内容：(主行, 高亮进度, 第二行, 第二行是否是「下一句」)。"""
+        """What to show: (main line, highlight progress, second line, whether the second line is the next line)."""
         t = self.track
         if not t:
             return None
@@ -219,16 +229,18 @@ class LyricsApp(QObject):
         if self.status == "skip":
             return head, None, "", False
         if self.status == "loading":
-            return head, None, "正在搜索歌词…", True
+            return head, None, tr("searching"), True
         if self.status == "none":
-            return head, None, "没有找到歌词", True
+            return head, None, tr("not_found"), True
         if self.status == "error":
-            return head, None, "歌词加载失败，右键 → 重新搜索歌词", True
+            return head, None, tr("load_failed"), True
 
         L = self.lyrics
+        if L.instrumental:
+            return head, None, tr("instrumental"), True
         pos = self.position()
         i = L.index_at(pos)
-        if i < 0:  # 前奏
+        if i < 0:  # intro
             return head, None, L.next_text(0), True
         start, text = L.lines[i]
         end = L.lines[i + 1][0] if i + 1 < len(L.lines) else start + 6
@@ -238,54 +250,76 @@ class LyricsApp(QObject):
             return text or "♪", progress, L.trans[i], False
         return text or "♪", progress, L.next_text(i + 1), True
 
-    # ------------------------------------------------------------ 菜单
+    # ------------------------------------------------------------ menu
 
     def _build_menu(self) -> QMenu:
         m = QMenu()
+        self._labels = []  # (action, text key), re-translated every time the menu opens
+
+        def add(menu: QMenu, key: str, slot, checkable: bool = False):
+            a = menu.addAction(tr(key), slot)
+            a.setCheckable(checkable)
+            self._labels.append((a, key))
+            return a
+
         self.act_info = m.addAction("")
         self.act_info.setEnabled(False)
         self.act_source = m.addAction("")
         self.act_source.setEnabled(False)
-        self.act_open = m.addAction("打开 Spotify", self.open_spotify)
+        self.act_open = add(m, "open_spotify", self.open_spotify)
         m.addSeparator()
 
         s = self.settings
-        self.act_follow = m.addAction("跟随 Spotify 歌词按钮", self._toggle_follow)
-        self.act_follow.setCheckable(True)
-        self.act_lock = m.addAction("锁定（鼠标穿透）", lambda: self.set_locked(not s["locked"]))
-        self.act_lock.setCheckable(True)
-        self.act_trans = m.addAction("显示翻译", lambda: self._toggle("translation"))
-        self.act_trans.setCheckable(True)
-        self.act_second = m.addAction("显示第二行", lambda: self._toggle("second_line", relayout=True))
-        self.act_second.setCheckable(True)
+        self.act_follow = add(m, "follow", self._toggle_follow, checkable=True)
+        self.act_lock = add(m, "lock", lambda: self.set_locked(not s["locked"]), checkable=True)
+        self.act_trans = add(m, "translation", lambda: self._toggle("translation"), checkable=True)
+        self.act_second = add(m, "second_line", lambda: self._toggle("second_line", relayout=True), checkable=True)
         m.addSeparator()
 
         self.act_offset = m.addAction("")
         self.act_offset.setEnabled(False)
-        m.addAction("歌词提前 0.5 秒", lambda: self.shift(+0.5))
-        m.addAction("歌词延后 0.5 秒", lambda: self.shift(-0.5))
-        m.addAction("偏移归零", lambda: self.shift(None))
-        m.addAction("重新搜索歌词", lambda: self.fetch(use_cache=False))
+        add(m, "earlier", lambda: self.shift(+0.5))
+        add(m, "later", lambda: self.shift(-0.5))
+        add(m, "reset_offset", lambda: self.shift(None))
+        add(m, "research", lambda: self.fetch(use_cache=False))
         m.addSeparator()
 
-        look = m.addMenu("外观")
-        look.addAction("字号 +", lambda: self.change_font(+2))
-        look.addAction("字号 −", lambda: self.change_font(-2))
-        look.addAction("字体…", self.pick_font)
-        look.addAction("文字颜色…", lambda: self.pick_color("color"))
-        look.addAction("高亮颜色…", lambda: self.pick_color("highlight"))
-        self.act_autostart = m.addAction("开机自动启动", self.toggle_autostart)
-        self.act_autostart.setCheckable(True)
-        m.addAction("退出", QApplication.quit)
+        look = m.addMenu(tr("appearance"))
+        self._labels.append((look.menuAction(), "appearance"))
+        add(look, "font_bigger", lambda: self.change_font(+2))
+        add(look, "font_smaller", lambda: self.change_font(-2))
+        add(look, "font", self.pick_font)
+        add(look, "text_color", lambda: self.pick_color("color"))
+        add(look, "highlight_color", lambda: self.pick_color("highlight"))
+
+        langs = m.addMenu(tr("language"))
+        group = QActionGroup(langs)
+        self.act_langs = {}
+        for code, name in i18n.LANGUAGES.items():
+            a = langs.addAction(name)
+            a.setCheckable(True)
+            a.triggered.connect(partial(self.change_language, code))
+            group.addAction(a)
+            self.act_langs[code] = a
+
+        self.act_autostart = add(m, "autostart", self.toggle_autostart, checkable=True)
+        add(m, "quit", QApplication.quit)
         m.aboutToShow.connect(self._refresh_menu)
         return m
 
     def _refresh_menu(self):
         s, t = self.settings, self.track
+        for a, key in self._labels:
+            a.setText(tr(key))
         self.act_info.setText(f"♪ {t.title} - {t.artist}" if t else
-                              "Spotify 没在播放" if self.running else "Spotify 没有打开")
-        src = {"ok": f"歌词：{self.lyrics.source}（{self.lyrics.matched}）" if self.lyrics else "",
-               "loading": "歌词：搜索中…", "none": "歌词：没找到", "error": "歌词：加载失败"}.get(self.status, "")
+                              tr("spotify_idle") if self.running else tr("spotify_closed"))
+        if self.status == "ok" and self.lyrics:
+            source = self.lyrics.source
+            name = tr(f"source_{source}") if i18n.has(f"source_{source}") else source
+            src = tr("lyrics_from", source=name, matched=self.lyrics.matched)
+        else:
+            src = {"loading": tr("lyrics_searching"), "none": tr("lyrics_none"),
+                   "error": tr("lyrics_error")}.get(self.status, "")
         self.act_source.setText(src[:60] + ("…" if len(src) > 60 else ""))
         self.act_source.setVisible(bool(src))
         self.act_open.setVisible(not self.running)
@@ -293,8 +327,17 @@ class LyricsApp(QObject):
         self.act_lock.setChecked(s["locked"])
         self.act_trans.setChecked(s["translation"])
         self.act_second.setChecked(s["second_line"])
-        self.act_offset.setText(f"当前歌曲偏移：{self.offset():+.1f} 秒")
+        self.act_offset.setText(tr("offset_now", offset=self.offset()))
+        for code, a in self.act_langs.items():
+            a.setChecked(code == s["language"])
         self.act_autostart.setChecked(_autostart_enabled())
+
+    def change_language(self, code: str, *_):
+        self.settings["language"] = code
+        self.settings.save()
+        i18n.set_language(code)
+        self._update_tooltip()
+        self.overlay.update()
 
     def _toggle(self, name: str, relayout: bool = False):
         self.settings[name] = not self.settings[name]
@@ -324,7 +367,7 @@ class LyricsApp(QObject):
         self.settings.save()
         self.overlay.apply_lock()
         if locked:
-            self.tip("locked", "已锁定，鼠标会穿过歌词。把鼠标移到歌词上方，点出现的小锁就能解锁。")
+            self.tip("locked", "tip_locked")
 
     def shift(self, delta: float | None):
         if not self.key:
@@ -343,13 +386,13 @@ class LyricsApp(QObject):
         self.overlay.relayout()
 
     def pick_font(self):
-        ok, font = QFontDialog.getFont(QFont(self.settings["font_family"]), None, "歌词字体")
+        ok, font = QFontDialog.getFont(QFont(self.settings["font_family"]), None, tr("font_title"))
         if ok:
             self.settings["font_family"] = font.family()
             self.settings.save()
 
     def pick_color(self, name: str):
-        c = QColorDialog.getColor(QColor(self.settings[name]), None, "选择颜色")
+        c = QColorDialog.getColor(QColor(self.settings[name]), None, tr("color_title"))
         if c.isValid():
             self.settings[name] = c.name()
             self.settings.save()
@@ -378,7 +421,24 @@ def _autostart_enabled() -> bool:
         return False
 
 
+def _icon_font(pixel_size: int) -> QFont:
+    f = QFont()
+    f.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+    f.setPixelSize(pixel_size)
+    return f
+
+
+# glyphs from Segoe Fluent Icons / Segoe MDL2 Assets
+ICON = {"prev": chr(0xE892), "play": chr(0xE768), "pause": chr(0xE769), "next": chr(0xE893),
+        "lock": chr(0xE72E), "unlock": chr(0xE785), "menu": chr(0xE713), "close": chr(0xE8BB),
+        "mic": chr(0xE720)}
+# (button, tooltip text key); None is a gap between the two groups
+BUTTONS = [("prev", "btn_prev"), ("toggle", "btn_toggle"), ("next", "btn_next"), None,
+           ("lock", "btn_lock"), ("menu", "btn_menu"), ("close", "btn_close")]
+
+
 def _make_icon() -> QIcon:
+    """Green circle with a microphone, like Spotify's lyrics button."""
     pm = QPixmap(256, 256)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -386,46 +446,34 @@ def _make_icon() -> QIcon:
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(QColor("#1ed760"))
     p.drawEllipse(8, 8, 240, 240)
-    f = QFont("Microsoft YaHei UI")
-    f.setPixelSize(144)
-    f.setBold(True)
-    p.setFont(f)
+    p.setFont(_icon_font(136))
     p.setPen(QColor("#000000"))
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "词")
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, ICON["mic"])
     p.end()
     return QIcon(pm)
 
 
-# Segoe Fluent Icons / Segoe MDL2 Assets 里的图标
-ICON = {"prev": chr(0xE892), "play": chr(0xE768), "pause": chr(0xE769), "next": chr(0xE893),
-        "lock": chr(0xE72E), "unlock": chr(0xE785), "menu": chr(0xE713), "close": chr(0xE8BB)}
-BUTTONS = [("prev", "上一首"), ("toggle", "播放 / 暂停"), ("next", "下一首"), None,
-           ("lock", "锁定（鼠标穿透）"), ("menu", "设置"), ("close", "隐藏歌词")]
-
-
 class Overlay(QWidget):
     PAD = 12
-    EDGE = 10    # 左右边缘这么宽的范围内拖动是调宽度
-    BTN = 30     # 按钮边长
-    TB_TOP = 6   # 按钮栏离顶部的距离
-    TOP = 42     # 歌词区离顶部的距离（上面留给按钮栏）
+    EDGE = 10    # dragging within this distance of the left / right edge resizes the window
+    BTN = 30     # button size
+    TB_TOP = 6   # distance from the top to the button bar
+    TOP = 42     # distance from the top to the lyrics (the button bar sits above them)
 
     def __init__(self, app: LyricsApp):
         super().__init__(None)
         self.app = app
         self.s = app.settings
         self.hover = False
-        self.hot: str | None = None      # 鼠标下面的按钮
+        self.hot: str | None = None      # button under the mouse
         self._click_through: bool | None = None
-        self.setWindowTitle("Spotify 歌词")
+        self.setWindowTitle(tr("app_name"))
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setMinimumWidth(300)
-        self.icon_font = QFont()
-        self.icon_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
-        self.icon_font.setPixelSize(15)
+        self.icon_font = _icon_font(15)
         self.relayout()
         self.resize(self.s["width"], self.height())
         self._place()
@@ -476,7 +524,7 @@ class Overlay(QWidget):
     def _hit(self, pt: QPointF) -> str | None:
         return next((key for key, r in self._buttons() if r.contains(pt)), None)
 
-    # ------------------------------------------------------------ 锁定 = 鼠标穿透
+    # ------------------------------------------------------------ locked = click-through
 
     def _set_click_through(self, on: bool):
         if on == self._click_through:
@@ -504,14 +552,14 @@ class Overlay(QWidget):
         self.hover = self.rect().contains(pos.toPoint())
         hot = self._hit(pos) if self.hover else None
         if self.s["locked"]:
-            # 锁定时整个窗口鼠标穿透，只有鼠标停在小锁上时才接收点击
+            # while locked the whole window is click-through, except when the mouse is on the small lock
             hot = hot if hot == "lock" else None
             self._set_click_through(hot is None)
         if hot != self.hot:
             self.hot = hot
             tips = dict(b for b in BUTTONS if b)
             if hot:
-                QToolTip.showText(QCursor.pos(), "解锁" if self.s["locked"] else tips[hot], self)
+                QToolTip.showText(QCursor.pos(), tr("btn_unlock" if self.s["locked"] else tips[hot]), self)
             else:
                 QToolTip.hideText()
         if not self.s["locked"]:
@@ -525,14 +573,14 @@ class Overlay(QWidget):
                 self.setCursor(shape)
         self.update()
 
-    # ------------------------------------------------------------ 绘制
+    # ------------------------------------------------------------ painting
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         locked = self.s["locked"]
         if not locked:
-            # 全透明的像素会被鼠标点穿，所以没悬停时也铺一层几乎看不见的底色
+            # fully transparent pixels let clicks through, so keep an almost invisible background
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 110 if self.hover else 1))
             p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
@@ -551,7 +599,7 @@ class Overlay(QWidget):
             if not locked:
                 hint = QColor(color)
                 hint.setAlpha(170)
-                self._draw_text(p, "等待 Spotify 播放…", sub_font, rect1, hint)
+                self._draw_text(p, tr("waiting"), sub_font, rect1, hint)
             return
 
         main, progress, sub, sub_is_next = view
@@ -568,7 +616,7 @@ class Overlay(QWidget):
         for key, r in self._buttons():
             if locked and key != "lock":
                 continue
-            if locked:  # 锁定时只画一个带底色的小锁，背景再花也看得见
+            if locked:  # only the small lock, on its own background so it stays visible on any wallpaper
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(0, 0, 0, 150 if self.hot else 100))
                 p.drawRoundedRect(r, 8, 8)
@@ -585,7 +633,7 @@ class Overlay(QWidget):
                    progress: float | None = None, highlight: QColor | None = None):
         fm = QFontMetricsF(font)
         width = fm.horizontalAdvance(text)
-        if width > rect.width():  # 太长就缩小字号塞进去
+        if width > rect.width():  # too long: shrink the font to fit
             font = QFont(font)
             font.setPixelSize(max(10, int(font.pixelSize() * rect.width() / width)))
             fm = QFontMetricsF(font)
@@ -607,7 +655,7 @@ class Overlay(QWidget):
             p.fillPath(path, highlight)
             p.restore()
 
-    # ------------------------------------------------------------ 鼠标
+    # ------------------------------------------------------------ mouse
 
     def _edge(self, x: float):
         if x <= self.EDGE:
@@ -660,15 +708,15 @@ def main():
     handler = RotatingFileHandler(DATA / "app.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8")
     logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, handlers=[handler],
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    sys.excepthook = lambda *exc: log.critical("未处理的异常", exc_info=exc)
+    sys.excepthook = lambda *exc: log.critical("Unhandled exception", exc_info=exc)
 
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
     lock = QLockFile(str(DATA / "app.lock"))
     if not lock.tryLock(100):
-        return  # 已经有一个在运行了
+        return  # another instance is already running
     app = LyricsApp(debug=debug)
-    log.info("启动")
+    log.info("Started v%s", __version__)
     code = qapp.exec()
     app.pool.shutdown(wait=False, cancel_futures=True)
     sys.exit(code)

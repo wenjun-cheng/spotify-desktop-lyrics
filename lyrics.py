@@ -1,4 +1,4 @@
-"""搜索带时间轴的歌词：QQ音乐 / 网易云 / LRCLIB，结果缓存在本地。"""
+"""Find time-synced lyrics on QQ Music / NetEase Cloud Music / LRCLIB, with a local cache."""
 from __future__ import annotations
 
 import hashlib
@@ -24,48 +24,59 @@ log = logging.getLogger(__name__)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
-ACCEPT = 0.6     # 低于这个分数的候选直接不要
-GOOD = 0.78      # 歌名 + 时长都对上就够了，不用再查其它源
-MISS_TTL = 3 * 24 * 3600  # 没找到的歌 3 天内不再重复搜索
+ACCEPT = 0.6     # candidates scoring below this are ignored
+GOOD = 0.78      # title + duration match: good enough, skip the remaining sources
+MISS_TTL = 3 * 24 * 3600  # don't search again for a song we failed to find within 3 days
+
+# Chinese, Japanese and Korean characters
+CJK = re.compile("[%s-%s%s-%s%s-%s]" % (chr(0x3040), chr(0x30FF), chr(0x3400), chr(0x9FFF),
+                                        chr(0xAC00), chr(0xD7AF)))
+INSTRUMENTAL_MARK = "纯音乐"  # how QQ Music / NetEase label songs without lyrics
+_LEGACY_SOURCES = {"QQ音乐": "qq", "网易云": "netease", "LRCLIB": "lrclib"}  # caches from v0.1.0
 
 
 @dataclass
 class Lyrics:
-    lines: list[tuple[float, str]]  # (开始秒数, 文本)，按时间排序
-    trans: list[str]                # 和 lines 一一对应的译文，没有就是 ""
-    source: str
-    matched: str                    # 实际匹配到的「歌名 - 歌手」
+    lines: list[tuple[float, str]]  # (start in seconds, text), sorted by time
+    trans: list[str]                # translation of each line, "" if none
+    source: str                     # "qq" / "netease" / "lrclib"
+    matched: str                    # "title - artist" of the song we actually matched
+    instrumental: bool = False
     starts: list[float] = field(init=False, repr=False)
 
     def __post_init__(self):
         self.starts = [t for t, _ in self.lines]
 
     def index_at(self, t: float) -> int:
-        """t 时刻正在唱的行号；还没到第一行时返回 -1。"""
+        """Index of the line being sung at time t, or -1 before the first line."""
         return bisect_right(self.starts, t) - 1
 
     def next_text(self, i: int) -> str:
-        """从第 i 行起第一句非空歌词。"""
+        """First non-empty line from line i on."""
         return next((s for _, s in self.lines[max(i, 0):] if s), "")
 
     def to_dict(self) -> dict:
-        return {"lines": self.lines, "trans": self.trans, "source": self.source, "matched": self.matched}
+        return {"lines": self.lines, "trans": self.trans, "source": self.source, "matched": self.matched,
+                "instrumental": self.instrumental}
 
     @classmethod
     def from_dict(cls, d: dict) -> Lyrics:
-        return cls([(float(t), s) for t, s in d["lines"]], list(d["trans"]), d["source"], d["matched"])
+        lines = [(float(t), s) for t, s in d["lines"]]
+        instrumental = d.get("instrumental") or (len(lines) == 1 and INSTRUMENTAL_MARK in lines[0][1])
+        return cls(lines, list(d["trans"]), _LEGACY_SOURCES.get(d["source"], d["source"]), d["matched"],
+                   bool(instrumental))
 
 
 @dataclass
 class Candidate:
-    name: str          # 歌名本体，用来比相似度
-    full: str          # 带版本说明的完整标题，用来识别 Live / 伴奏 / 翻唱
+    name: str          # bare song title, used for similarity
+    full: str          # full title with version notes, used to spot live / karaoke / cover versions
     artists: list[str]
-    duration: float    # 秒
-    fetch: Callable[[], tuple[str, str]]  # -> (lrc, 译文 lrc)
+    duration: float    # seconds
+    fetch: Callable[[], tuple[str, str]]  # -> (lrc, translation lrc)
 
 
-# ---------------------------------------------------------------- LRC 解析
+# ---------------------------------------------------------------- LRC parsing
 
 _STAMP = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
 _OFFSET = re.compile(r"\[offset:\s*([+-]?\d+)\s*\]", re.I)
@@ -84,11 +95,11 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
             stamps.append(int(m.group(1)) * 60 + float(m.group(2).replace(":", ".")))
             pos = m.end()
         text_part = raw[pos:].strip()
-        if text_part == "//":  # QQ 音乐译文里的「本句无翻译」
+        if text_part == "//":  # QQ Music's "no translation for this line"
             text_part = ""
         out.extend((t, text_part) for t in stamps)
     out.sort(key=lambda x: x[0])
-    # LRC 的 offset 为正表示歌词要提前出现
+    # a positive LRC offset means the lyrics should show up earlier
     return [(max(0.0, t - offset), s) for t, s in out]
 
 
@@ -96,8 +107,10 @@ def build_lyrics(lrc: str, trans_lrc: str, source: str, matched: str) -> Lyrics 
     lines = parse_lrc(lrc)
     if not any(s for _, s in lines):
         return None
-    if sum(1 for t, _ in lines if t > 0) < 2 and not any("纯音乐" in s for _, s in lines):
-        return None  # 没有时间轴，没法同步
+    if sum(1 for t, _ in lines if t > 0) < 2:
+        if any(INSTRUMENTAL_MARK in s for _, s in lines):
+            return Lyrics([(0.0, "")], [""], source, matched, instrumental=True)
+        return None  # no timestamps, can't sync
     by_cs = {round(t * 100): s for t, s in parse_lrc(trans_lrc) if s}
     trans = []
     for t, s in lines:
@@ -107,7 +120,7 @@ def build_lyrics(lrc: str, trans_lrc: str, source: str, matched: str) -> Lyrics 
     return Lyrics(lines, trans, source, matched)
 
 
-# ---------------------------------------------------------------- 匹配打分
+# ---------------------------------------------------------------- matching
 
 _BRACKETS = re.compile(r"[(\[（【「《<].*?[)\]）】」》>]")
 _VERSION_WORDS = [
@@ -154,7 +167,7 @@ def score(c: Candidate, track: Track) -> float:
     wanted = _split_artists(track.artist) or [track.artist]
     a = max((_sim(x, y) for x in c.artists for y in wanted), default=0.0)
     if a < 0.6:
-        a = 0.0  # "Jay Chou" 对 "周杰伦" 这种比不了的，零碎的相似度只是噪音
+        a = 0.0  # "Jay Chou" vs "周杰伦" can't be compared; small similarities are just noise
     if track.duration and c.duration:
         diff = abs(track.duration - c.duration)
         d = 1.0 if diff <= 2 else 0.7 if diff <= 5 else 0.3 if diff <= 10 else 0.0
@@ -164,7 +177,7 @@ def score(c: Candidate, track: Track) -> float:
     return 0.5 * t + 0.2 * a + 0.3 * d - penalty
 
 
-# ---------------------------------------------------------------- 歌词源
+# ---------------------------------------------------------------- sources
 
 def _http(url: str, *, data=None, headers=None, timeout: float = 8):
     h = {"User-Agent": UA}
@@ -178,7 +191,7 @@ def _http(url: str, *, data=None, headers=None, timeout: float = 8):
 
 
 def _clean_title(title: str) -> str:
-    """搜索用：去掉 " - Remastered"、"(feat. X)" 之类会干扰搜索的尾巴。"""
+    """For searching: drop tails like " - Remastered" or "(feat. X)" that confuse search engines."""
     t = re.split(r"\s+[-–—]\s+", title)[0]
     t = re.sub(r"\s*[(\[（【][^)\]）】]*(?:feat|ft\.|with|remaster|version|版)[^)\]）】]*[)\]）】]", "", t, flags=re.I)
     return t.strip() or title
@@ -231,7 +244,7 @@ def netease_search(track: Track, title_only: bool) -> list[Candidate]:
 def netease_lyric(song_id: int) -> tuple[str, str]:
     d = _http(f"https://music.163.com/api/song/lyric?id={song_id}&lv=1&tv=-1", headers=NE_HEADERS)
     if d.get("pureMusic") or d.get("nolyric"):
-        return "[00:00.00]纯音乐，请欣赏", ""
+        return f"[00:00.00]{INSTRUMENTAL_MARK}", ""
     return (d.get("lrc") or {}).get("lyric") or "", (d.get("tlyric") or {}).get("lyric") or ""
 
 
@@ -239,17 +252,16 @@ def lrclib_search(track: Track, title_only: bool) -> list[Candidate]:
     params = ({"q": _clean_title(track.title)} if title_only
               else {"track_name": _clean_title(track.title), "artist_name": track.artist})
     d = _http("https://lrclib.net/api/search?" + urllib.parse.urlencode(params),
-              headers={"User-Agent": "SpotifyLyricsOverlay/1.0"})
+              headers={"User-Agent": "spotify-desktop-lyrics (https://github.com/wenjun-cheng/spotify-desktop-lyrics)"})
     return [Candidate(s["trackName"], s["trackName"], [s.get("artistName") or ""], float(s.get("duration") or 0),
                       partial(lambda lrc: (lrc, ""), s["syncedLyrics"]))
             for s in d[:15] if s.get("syncedLyrics")]
 
 
-SOURCES = {"QQ音乐": qq_search, "网易云": netease_search, "LRCLIB": lrclib_search}
-CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")  # 中日韩文字
+SOURCES = {"qq": qq_search, "netease": netease_search, "lrclib": lrclib_search}
 
 
-# ---------------------------------------------------------------- 对外接口
+# ---------------------------------------------------------------- public API
 
 def track_key(track: Track) -> str:
     return f"{track.title}\n{track.artist}\n{track.album}"
@@ -265,9 +277,10 @@ def find_lyrics(track: Track, cache_dir: Path, use_cache: bool = True) -> Lyrics
             if time.time() - d.get("miss", 0) < MISS_TTL:
                 return None
         except Exception:
-            log.exception("缓存损坏：%s", cache)
+            log.exception("Corrupted cache file: %s", cache)
 
-    order = ["QQ音乐", "网易云", "LRCLIB"] if CJK.search(track.title + track.artist) else ["网易云", "QQ音乐", "LRCLIB"]
+    # CJK songs: QQ Music first; everything else: NetEase first (it often has Chinese translations)
+    order = ["qq", "netease", "lrclib"] if CJK.search(track.title + track.artist) else ["netease", "qq", "lrclib"]
     best: tuple[float, Lyrics] | None = None
     errors = 0
     for title_only in (False, True):
@@ -276,9 +289,9 @@ def find_lyrics(track: Track, cache_dir: Path, use_cache: bool = True) -> Lyrics
                 cands = SOURCES[name](track, title_only)
             except Exception as e:
                 errors += 1
-                log.warning("%s 搜索失败：%s", name, e)
+                log.warning("%s search failed: %s", name, e)
                 continue
-            # 同分时按搜索结果原本的排名
+            # on equal scores, keep the source's own ranking
             ranked = sorted(((score(c, track) - 0.001 * i, c) for i, c in enumerate(cands)),
                             key=lambda x: x[0], reverse=True)
             for s, c in ranked[:3]:
@@ -287,11 +300,11 @@ def find_lyrics(track: Track, cache_dir: Path, use_cache: bool = True) -> Lyrics
                 try:
                     lyr = build_lyrics(*c.fetch(), name, f"{c.full} - {' / '.join(c.artists[:2])}")
                 except Exception as e:
-                    log.warning("%s 取歌词失败：%s", name, e)
+                    log.warning("%s lyrics download failed: %s", name, e)
                     continue
                 if lyr:
                     best = (s, lyr)
-                    log.info("候选 %.2f [%s] %s", s, name, lyr.matched)
+                    log.info("candidate %.2f [%s] %s", s, name, lyr.matched)
                     break
             if best and best[0] >= GOOD:
                 break
@@ -300,10 +313,10 @@ def find_lyrics(track: Track, cache_dir: Path, use_cache: bool = True) -> Lyrics
 
     if best is None and errors:
         if errors == 2 * len(order):
-            raise ConnectionError("所有歌词源都连不上")
-        return None  # 有歌词源没连上，这次的「没找到」不算数，不写缓存
+            raise ConnectionError("none of the lyrics sources could be reached")
+        return None  # some source was unreachable, so don't cache this miss
     cache_dir.mkdir(parents=True, exist_ok=True)
     payload = {"lyrics": best[1].to_dict()} if best else {"miss": time.time()}
     cache.write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
-    log.info("%s - %s -> %s", track.title, track.artist, best[1].matched if best else "未找到")
+    log.info("%s - %s -> %s", track.title, track.artist, best[1].matched if best else "not found")
     return best[1] if best else None

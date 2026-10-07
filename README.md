@@ -1,71 +1,74 @@
-# Spotify 桌面歌词
+# Spotify Desktop Lyrics
 
-给 Windows 上的 Spotify 电脑版加一个桌面歌词浮窗。
+**English** | [简体中文](README.zh-CN.md)
 
-![预览](docs/preview.png)
+A desktop lyrics overlay for the Spotify desktop app on Windows.
 
-## 功能
+![Preview](docs/preview.png)
 
-- 透明置顶的歌词浮窗，逐行高亮，带描边，在什么背景上都看得清
-- 歌词来自 QQ 音乐、网易云音乐和 LRCLIB，按歌名、歌手、时长自动挑最匹配的版本，避开翻唱、Live、伴奏
-- 外文歌显示中文翻译（歌词源里有翻译时）
-- **跟随 Spotify 的歌词按钮**：点 Spotify 播放栏里的麦克风图标就显示，再点一次隐藏；关掉 Spotify 自动隐藏
-- 鼠标移上去出现按钮：上一首 / 播放暂停 / 下一首 / 锁定 / 设置 / 隐藏
-- 锁定后鼠标穿透；鼠标移上去会出现一个小锁，点一下解锁
-- 每首歌可以单独调歌词快慢；字号、字体、颜色可调；可以开机自启
-- 不用登录 Spotify 账号，也不用申请 Spotify API
+## Features
 
-## 下载使用
+- Transparent always-on-top lyrics with a line-by-line highlight and an outline that stays readable on any background
+- Lyrics from QQ Music, NetEase Cloud Music and LRCLIB, automatically matched by title, artist and duration, skipping covers, live versions and karaoke tracks
+- Shows a Chinese translation for foreign-language songs when the lyrics source has one
+- **Follows Spotify's own lyrics button**: click the microphone icon in Spotify's playback bar to show the lyrics, click it again to hide them; closing Spotify hides them too
+- Hover over the lyrics for buttons: previous / play-pause / next / lock / settings / hide
+- Lock to make the lyrics click-through; hover and click the small lock to unlock
+- Per-song timing offset; adjustable text size, font and colors; optional start with Windows
+- English and Chinese interface (English by default; switch under **Language / 语言** in the menu)
+- No Spotify login or Spotify API key needed
 
-1. 到 [Releases](../../releases) 下载 `SpotifyLyrics-x.y.z-win64.zip`，解压到任意位置
-2. 双击 `SpotifyLyrics.exe`，任务栏托盘里会出现一个绿色的「词」图标
-3. 打开 Spotify 放首歌，点播放栏里的麦克风图标
+## Download
 
-第一次运行时 Windows 可能提示「Windows 已保护你的电脑」（程序没有数字签名），点「更多信息」→「仍要运行」即可。
+1. Download `SpotifyLyrics-x.y.z-win64.zip` from [Releases](../../releases) and unzip it anywhere
+2. Run `SpotifyLyrics.exe`; a green microphone icon appears in the system tray
+3. Play a song in Spotify and click the microphone icon in its playback bar
 
-环境要求：Windows 10 / 11，Spotify 官网下载的桌面版（微软商店版理论上也能用，没测试过）。
+Windows may show "Windows protected your PC" the first time (the app isn't code-signed). Click **More info** → **Run anyway**.
 
-## 操作
+Requirements: Windows 10 / 11 and the Spotify desktop app downloaded from spotify.com (the Microsoft Store version should work too, but hasn't been tested).
 
-| 操作 | 效果 |
+## Controls
+
+| Action | Effect |
 | --- | --- |
-| 拖动浮窗 | 移动位置 |
-| 拖左右边缘 | 调宽度 |
-| 滚轮 | 调字号 |
-| 右键，或点设置按钮 | 打开菜单 |
-| 单击托盘图标 | 显示 / 隐藏歌词 |
+| Drag the lyrics | Move them |
+| Drag the left / right edge | Change the width |
+| Mouse wheel | Change the text size |
+| Right-click, or the settings button | Open the menu |
+| Click the tray icon | Show / hide the lyrics |
 
-菜单里还有：歌词提前 / 延后 0.5 秒（按歌记住）、重新搜索歌词、显示翻译、显示第二行、跟随 Spotify 歌词按钮、外观设置、开机自动启动。
+The menu also has: lyrics 0.5 s earlier / later (remembered per song), search lyrics again, show translation, show second line, follow Spotify's lyrics button, appearance, language, start with Windows.
 
-## 原理
+## How it works
 
-- **播放信息**：通过 Windows 的系统媒体控件（SMTC）读 Spotify 正在放的歌和播放进度，播放控制也走它
-- **歌词按钮**：通过 UI Automation（读屏软件用的接口）读 Spotify 播放栏里「歌词」按钮的开关状态。如果 Spotify 改版后找不到这个按钮，会自动退回成「Spotify 开着就显示」
-- **歌词**：中日韩歌曲先查 QQ 音乐，其它先查网易云，都找不到再查 LRCLIB。结果缓存在本地，同一首歌第二次播放不再联网
+- **Playback info**: the current track and position come from Windows' media controls (SMTC), which are also used for the playback buttons
+- **Lyrics button**: the state of the lyrics button in Spotify's playback bar is read through UI Automation (the API screen readers use). If a Spotify update ever makes the button impossible to find, the app falls back to "show while Spotify is open"
+- **Lyrics**: songs with Chinese, Japanese or Korean titles are looked up on QQ Music first, everything else on NetEase first, with LRCLIB as the last resort. Results are cached, so a song only needs to be looked up once
 
-## 数据和卸载
+## Data and uninstalling
 
-设置、歌词缓存和日志都放在 `%APPDATA%\SpotifyLyrics`。
+Settings, the lyrics cache and the log live in `%APPDATA%\SpotifyLyrics`.
 
-卸载：先在菜单里取消「开机自动启动」，退出程序，再删掉程序文件夹和上面这个目录。
+To uninstall: turn off **Start with Windows** in the menu, quit the app, then delete the app folder and the folder above.
 
-## 从源码运行和打包
+## Running from source and building
 
-在 Python 3.11 下测试过。
+Tested with Python 3.11.
 
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\pythonw app.py      # 运行；加 --debug 会在日志里记录播放进度的详细数据
+.venv\Scripts\pythonw app.py      # run; add --debug to log detailed playback timing
 
 .venv\Scripts\pip install pyinstaller
-.\build.ps1                        # 打包，结果在 dist\
+.\build.ps1                        # build into dist\
 ```
 
-## 声明
+## Disclaimer
 
-本项目和 Spotify、QQ 音乐、网易云音乐都没有关系。歌词版权归原作者和各平台所有，本工具只是在本机显示歌词，仅供个人使用。QQ 音乐和网易云的接口不是官方公开 API，随时可能失效。
+This project isn't affiliated with Spotify, QQ Music or NetEase Cloud Music. Lyrics are copyrighted by their authors and the respective platforms; this tool only displays them on your own computer, for personal use. The QQ Music and NetEase endpoints aren't official public APIs and may stop working at any time.
 
-## 许可
+## License
 
 [MIT](LICENSE)
