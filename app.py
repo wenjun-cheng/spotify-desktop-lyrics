@@ -27,7 +27,7 @@ import lyrics as lyr
 from i18n import tr
 from media import MediaWatcher, Snapshot, Track
 
-__version__ = "0.3.1"
+__version__ = "0.1.0"
 ROOT = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
 DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyLyrics"  # settings, lyrics cache, log
