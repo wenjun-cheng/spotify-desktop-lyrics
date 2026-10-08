@@ -5,7 +5,6 @@ import ctypes
 import json
 import logging
 import os
-import re
 import sys
 import time
 import winreg
@@ -70,13 +69,6 @@ class Settings(dict):
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self, ensure_ascii=False, indent=2), "utf-8")
         tmp.replace(self.path)
-
-
-def _sing_seconds(text: str) -> float:
-    """Rough guess of how long a line takes to sing; sets the speed of the highlight sweep."""
-    cjk = len(lyr.CJK.findall(text))
-    other = len(re.sub(r"\s", "", text)) - cjk
-    return 1.0 + 0.45 * cjk + 0.07 * other
 
 
 class LyricsApp(QObject):
@@ -220,35 +212,32 @@ class LyricsApp(QObject):
         self.lyrics = lyrics
         self.status = "ok" if lyrics else "none" if ok else "error"
 
-    def view(self) -> tuple[str, float | None, str, bool] | None:
-        """What to show: (main line, highlight progress, second line, whether the second line is the next line)."""
+    def view(self) -> tuple[str, bool, str, bool] | None:
+        """What to show: (main line, whether it's the line being sung, second line,
+        whether the second line is the next line)."""
         t = self.track
         if not t:
             return None
         head = f"{t.title} - {t.artist}" if t.artist else t.title
         if self.status == "skip":
-            return head, None, "", False
+            return head, False, "", False
         if self.status == "loading":
-            return head, None, tr("searching"), True
+            return head, False, tr("searching"), True
         if self.status == "none":
-            return head, None, tr("not_found"), True
+            return head, False, tr("not_found"), True
         if self.status == "error":
-            return head, None, tr("load_failed"), True
+            return head, False, tr("load_failed"), True
 
         L = self.lyrics
         if L.instrumental:
-            return head, None, tr("instrumental"), True
-        pos = self.position()
-        i = L.index_at(pos)
+            return head, False, tr("instrumental"), True
+        i = L.index_at(self.position())
         if i < 0:  # intro
-            return head, None, L.next_text(0), True
-        start, text = L.lines[i]
-        end = L.lines[i + 1][0] if i + 1 < len(L.lines) else start + 6
-        dur = min(end - start, max(2.5, _sing_seconds(text)))
-        progress = min(1.0, max(0.0, (pos - start) / dur)) if dur > 0 else 1.0
+            return head, False, L.next_text(0), True
+        text = L.lines[i][1] or "♪"
         if self.settings["translation"] and L.trans[i]:
-            return text or "♪", progress, L.trans[i], False
-        return text or "♪", progress, L.next_text(i + 1), True
+            return text, True, L.trans[i], False
+        return text, True, L.next_text(i + 1), True
 
     # ------------------------------------------------------------ menu
 
@@ -602,10 +591,10 @@ class Overlay(QWidget):
                 self._draw_text(p, tr("waiting"), sub_font, rect1, hint)
             return
 
-        main, progress, sub, sub_is_next = view
+        main, current, sub, sub_is_next = view
         if not self.app.playing:
             p.setOpacity(0.55)
-        self._draw_text(p, main, main_font, rect1, color, progress, QColor(self.s["highlight"]))
+        self._draw_text(p, main, main_font, rect1, QColor(self.s["highlight"]) if current else color)
         if h2 and sub:
             c2 = QColor(color)
             c2.setAlpha(165 if sub_is_next else 235)
@@ -629,8 +618,7 @@ class Overlay(QWidget):
             p.setPen(QColor(255, 255, 255, 235))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, glyph)
 
-    def _draw_text(self, p: QPainter, text: str, font: QFont, rect: QRectF, color: QColor,
-                   progress: float | None = None, highlight: QColor | None = None):
+    def _draw_text(self, p: QPainter, text: str, font: QFont, rect: QRectF, color: QColor):
         fm = QFontMetricsF(font)
         width = fm.horizontalAdvance(text)
         if width > rect.width():  # too long: shrink the font to fit
@@ -649,11 +637,6 @@ class Overlay(QWidget):
         p.strokePath(path, QPen(QColor(0, 0, 0, 160), outline, Qt.PenStyle.SolidLine,
                                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.fillPath(path, color)
-        if progress:
-            p.save()
-            p.setClipRect(QRectF(x - 2, rect.y(), (width + 4) * progress, rect.height()))
-            p.fillPath(path, highlight)
-            p.restore()
 
     # ------------------------------------------------------------ mouse
 
