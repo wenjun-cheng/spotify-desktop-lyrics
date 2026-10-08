@@ -16,7 +16,7 @@ If Windows says "Windows protected your PC", click **More info** → **Run anywa
 
 ## Features
 
-- Lyrics show up automatically while Spotify is open, with a Chinese translation for foreign-language songs
+- Lyrics show up automatically while Spotify is open
 - Lyrics from QQ Music, NetEase Cloud Music and LRCLIB
 - Hover over the lyrics for playback controls; right-click for settings
 - A desktop shortcut shows or hides the lyrics in one click

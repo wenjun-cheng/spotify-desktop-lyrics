@@ -43,7 +43,8 @@ DEFAULTS = {
     "x": None, "y": None, "width": 300,
     "font_family": "Microsoft YaHei UI", "font_size": 30,
     "color": "#ffffff", "highlight": "#1ed760",
-    "locked": False, "second_line": True, "translation": True,
+    "locked": False, "second_line": True,
+    "translation": False,  # show the lyrics source's translation under each line instead of the next line
     # Timing offsets in seconds; positive = lyrics earlier. Lines are timed to when singing starts,
     # so showing them a little early feels in sync.
     "global_offset": 0.4,

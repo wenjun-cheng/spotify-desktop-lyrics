@@ -279,7 +279,7 @@ def find_lyrics(track: Track, cache_dir: Path, use_cache: bool = True) -> Lyrics
         except Exception:
             log.exception("Corrupted cache file: %s", cache)
 
-    # CJK songs: QQ Music first; everything else: NetEase first (it often has Chinese translations)
+    # CJK songs: QQ Music first (it has the most Chinese-language catalog); everything else: NetEase first
     order = ["qq", "netease", "lrclib"] if CJK.search(track.title + track.artist) else ["netease", "qq", "lrclib"]
     best: tuple[float, Lyrics] | None = None
     errors = 0
