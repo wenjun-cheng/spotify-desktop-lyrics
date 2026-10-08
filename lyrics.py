@@ -103,8 +103,21 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
     return [(max(0.0, t - offset), s) for t, s in out]
 
 
+def _first_per_timestamp(lines: list[tuple[float, str]]) -> list[tuple[float, str]]:
+    """Some lyrics put a translation right under each line with the same timestamp.
+    Keep only the first line at each time, which is the original."""
+    out = []
+    for t, s in lines:
+        if out and abs(out[-1][0] - t) < 0.01:
+            if s and not out[-1][1]:
+                out[-1] = (out[-1][0], s)  # prefer text over an empty line
+            continue
+        out.append((t, s))
+    return out
+
+
 def build_lyrics(lrc: str, trans_lrc: str, source: str, matched: str) -> Lyrics | None:
-    lines = parse_lrc(lrc)
+    lines = _first_per_timestamp(parse_lrc(lrc))
     if not any(s for _, s in lines):
         return None
     if sum(1 for t, _ in lines if t > 0) < 2:
