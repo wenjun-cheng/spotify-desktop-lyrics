@@ -5,6 +5,7 @@ import ctypes
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import winreg
@@ -17,6 +18,7 @@ from pathlib import Path
 from PySide6.QtCore import QLockFile, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QActionGroup, QColor, QCursor, QFont, QFontMetricsF, QGuiApplication, QIcon,
                            QPainter, QPainterPath, QPen, QPixmap)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QColorDialog, QFontDialog, QMenu, QSystemTrayIcon, QToolTip,
                                QWidget)
 
@@ -24,15 +26,16 @@ import i18n
 import lyrics as lyr
 from i18n import tr
 from media import MediaWatcher, Snapshot, Track
-from spotify_ui import LyricsButtonWatcher
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 ROOT = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
 DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyLyrics"  # settings, lyrics cache, log
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "SpotifyLyrics"
 SPOTIFY_EXE = Path(os.environ.get("APPDATA", "")) / "Spotify" / "Spotify.exe"
+# Launching the app while it's already running toggles the lyrics in the running instance instead
+SERVER_NAME = f"SpotifyLyrics-{os.environ.get('USERNAME', 'user')}"
 log = logging.getLogger("app")
 
 DEFAULTS = {
@@ -41,7 +44,6 @@ DEFAULTS = {
     "font_family": "Microsoft YaHei UI", "font_size": 30,
     "color": "#ffffff", "highlight": "#1ed760",
     "locked": False, "second_line": True, "translation": True,
-    "follow_button": True,  # show / hide together with Spotify's own lyrics button
     # Timing offsets in seconds; positive = lyrics earlier. Lines are timed to when singing starts,
     # so showing them a little early feels in sync.
     "global_offset": 0.4,
@@ -77,7 +79,7 @@ class Settings(dict):
 class LyricsApp(QObject):
     snapshot = Signal(object)
     fetched = Signal(str, object, bool)  # key, Lyrics | None, finished without error
-    button_state = Signal(str)           # Spotify's lyrics button: on / off / pending / missing
+    notify = Signal(str)                 # text key of a tray message to show (from any thread)
 
     def __init__(self, debug: bool = False):
         super().__init__()
@@ -88,10 +90,9 @@ class LyricsApp(QObject):
         self.lyrics: lyr.Lyrics | None = None
         self.status = "idle"  # idle | skip | loading | ok | none | error
         self.pos, self.mono, self.playing = 0.0, time.monotonic(), False
-        # The overlay comes and goes with Spotify and its lyrics button. After the user hides it,
-        # it comes back the next time the lyrics button is clicked or Spotify is started.
+        # The overlay shows while Spotify is open. After the user hides it (tray icon, shortcut or the
+        # close button), it stays hidden until it's toggled back on or Spotify is started again.
         self.running = False
-        self.lyrics_btn = "pending"
         self.hidden_by_user = False
         self.force_show = False
 
@@ -101,7 +102,8 @@ class LyricsApp(QObject):
         self.fetch_timer = QTimer(self, singleShot=True, interval=600, timeout=self.fetch)
         self.snapshot.connect(self._on_snapshot)
         self.fetched.connect(self._on_fetched)
-        self.button_state.connect(self._on_button)
+        self.notify.connect(lambda key: self.tray.showMessage(
+            tr("app_name"), tr(key), QSystemTrayIcon.MessageIcon.Information, 5000))
 
         self.menu = self._build_menu()
         self.overlay = Overlay(self)
@@ -114,9 +116,22 @@ class LyricsApp(QObject):
             self.settings.save()
             self.tip("welcome", "tip_welcome")
 
+        self.server = QLocalServer(self)
+        QLocalServer.removeServer(SERVER_NAME)  # left over if a previous instance crashed
+        self.server.newConnection.connect(self._on_connection)
+        self.server.listen(SERVER_NAME)
+
         self.watcher = MediaWatcher(self.snapshot.emit, debug=debug)
         self.watcher.start()
-        LyricsButtonWatcher(self.button_state.emit, lambda: self.running).start()
+
+    def _on_connection(self):
+        """Another launch of the app (e.g. the desktop shortcut) asks us to do something."""
+        while sock := self.server.nextPendingConnection():
+            sock.waitForReadyRead(500)
+            if bytes(sock.readAll()).strip() == b"toggle":
+                self.toggle_overlay()
+            sock.disconnectFromServer()
+            sock.deleteLater()
 
     def tip(self, name: str, key: str):
         """Show a tray tip, but only once ever."""
@@ -166,20 +181,18 @@ class LyricsApp(QObject):
             self.fetch_timer.start()
         self._update_tooltip()
 
-    def _on_button(self, state: str):
-        prev, self.lyrics_btn = self.lyrics_btn, state
-        if {prev, state} == {"on", "off"}:
-            self.hidden_by_user = self.force_show = False  # the user clicked Spotify's button; follow it
-        if state == "off" and self.settings["follow_button"]:
-            self.tip("follow", "tip_follow")
-        self.sync_visibility()
-
     def sync_visibility(self):
-        # if the lyrics button can't be found ("missing"), fall back to "show while Spotify is open"
-        follow_ok = not self.settings["follow_button"] or self.lyrics_btn in ("on", "missing")
-        want = not self.hidden_by_user and (self.force_show or (self.running and follow_ok))
+        want = not self.hidden_by_user and (self.force_show or self.running)
         if want != self.overlay.isVisible():
             self.overlay.setVisible(want)
+
+    def toggle_overlay(self):
+        if self.overlay.isVisible():
+            self.hide_overlay()
+        else:
+            self.hidden_by_user, self.force_show = False, True
+            self.sync_visibility()
+        log.info("Lyrics toggled: %s", "shown" if self.overlay.isVisible() else "hidden")
 
     def control(self, command: str):
         """Playback control: toggle / next / prev."""
@@ -262,7 +275,6 @@ class LyricsApp(QObject):
         m.addSeparator()
 
         s = self.settings
-        self.act_follow = add(m, "follow", self._toggle_follow, checkable=True)
         self.act_lock = add(m, "lock", lambda: self.set_locked(not s["locked"]), checkable=True)
         self.act_trans = add(m, "translation", lambda: self._toggle("translation"), checkable=True)
         self.act_second = add(m, "second_line", lambda: self._toggle("second_line", relayout=True), checkable=True)
@@ -298,6 +310,7 @@ class LyricsApp(QObject):
             group.addAction(a)
             self.act_langs[code] = a
 
+        add(m, "shortcut", self.create_shortcut)
         self.act_autostart = add(m, "autostart", self.toggle_autostart, checkable=True)
         add(m, "quit", QApplication.quit)
         m.aboutToShow.connect(self._refresh_menu)
@@ -319,7 +332,6 @@ class LyricsApp(QObject):
         self.act_source.setText(src[:60] + ("…" if len(src) > 60 else ""))
         self.act_source.setVisible(bool(src))
         self.act_open.setVisible(not self.running)
-        self.act_follow.setChecked(s["follow_button"])
         self.act_lock.setChecked(s["locked"])
         self.act_trans.setChecked(s["translation"])
         self.act_second.setChecked(s["second_line"])
@@ -342,19 +354,29 @@ class LyricsApp(QObject):
         if relayout:
             self.overlay.relayout()
 
-    def _toggle_follow(self):
-        self._toggle("follow_button")
-        self.hidden_by_user = self.force_show = False
-        self.sync_visibility()
-
     def _on_tray(self, reason):
-        if reason != QSystemTrayIcon.ActivationReason.Trigger:
-            return
-        if self.overlay.isVisible():
-            self.hide_overlay()
-        else:
-            self.hidden_by_user, self.force_show = False, True
-            self.sync_visibility()
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_overlay()
+
+    def create_shortcut(self):
+        """Put a shortcut on the desktop. Clicking it starts the app, or shows / hides the lyrics if it's running."""
+        exe, args = _launch_target()
+        icon = exe if FROZEN else str(ROOT / "assets" / "icon.ico")
+        workdir = Path(exe).parent if FROZEN else ROOT
+        q = lambda s: "'" + str(s).replace("'", "''") + "'"  # PowerShell single-quoted string
+        script = ("$d = [Environment]::GetFolderPath('Desktop'); "
+                  f"$l = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d {q(tr('app_name') + '.lnk')})); "
+                  f"$l.TargetPath = {q(exe)}; $l.Arguments = {q(args)}; $l.WorkingDirectory = {q(workdir)}; "
+                  f"$l.IconLocation = {q(icon)}; $l.Description = {q(tr('shortcut_desc'))}; $l.Save()")
+
+        def run():
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            if r.returncode:
+                log.error("Creating the desktop shortcut failed: %s", r.stderr.strip())
+            self.notify.emit("shortcut_done" if r.returncode == 0 else "shortcut_failed")
+
+        self.pool.submit(run)  # PowerShell takes a moment to start; keep the UI responsive
 
     def open_spotify(self):
         os.startfile(str(SPOTIFY_EXE) if SPOTIFY_EXE.exists() else "spotify:")
@@ -407,11 +429,16 @@ class LyricsApp(QObject):
                 winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, _launch_command())
 
 
-def _launch_command() -> str:
+def _launch_target() -> tuple[str, str]:
+    """(program, arguments) that start this app."""
     if FROZEN:
-        return f'"{sys.executable}"'
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    return f'"{pythonw}" "{ROOT / "app.py"}"'
+        return sys.executable, ""
+    return str(Path(sys.executable).with_name("pythonw.exe")), f'"{ROOT / "app.py"}"'
+
+
+def _launch_command() -> str:
+    exe, args = _launch_target()
+    return f'"{exe}" {args}'.strip()
 
 
 def _autostart_enabled() -> bool:
@@ -698,6 +725,17 @@ class Overlay(QWidget):
         self.s.save()
 
 
+def _send_to_running_instance(command: bytes) -> bool:
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(1000):
+        return False
+    sock.write(command)
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
 def main():
     debug = "--debug" in sys.argv
     DATA.mkdir(parents=True, exist_ok=True)
@@ -710,7 +748,12 @@ def main():
     qapp.setQuitOnLastWindowClosed(False)
     lock = QLockFile(str(DATA / "app.lock"))
     if not lock.tryLock(100):
-        return  # another instance is already running
+        # Already running, e.g. the desktop shortcut was clicked again: show / hide the lyrics there.
+        for _ in range(10):  # the other instance may still be starting up
+            if _send_to_running_instance(b"toggle"):
+                break
+            time.sleep(0.3)
+        return
     app = LyricsApp(debug=debug)
     log.info("Started v%s", __version__)
     code = qapp.exec()

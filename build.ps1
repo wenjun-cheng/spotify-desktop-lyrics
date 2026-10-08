@@ -5,15 +5,12 @@
 Set-Location $PSScriptRoot
 $py = ".venv\Scripts\python.exe"
 
-# uiautomation generates its comtypes bindings on first import; make sure they exist before bundling
-& $py -c "import uiautomation"
-if ($LASTEXITCODE -ne 0) { throw "Generating comtypes bindings failed" }
 & $py -c "import sys; from PySide6.QtWidgets import QApplication; a = QApplication(sys.argv); import app; app._make_icon().pixmap(256, 256).save('assets/icon.ico')"
 if ($LASTEXITCODE -ne 0) { throw "Generating the icon failed" }
 
 & $py -m PyInstaller --noconfirm --clean --windowed --name SpotifyLyrics --icon assets\icon.ico `
-    --collect-submodules winrt --collect-submodules comtypes.gen --collect-data zhconv `
-    --exclude-module tkinter app.py
+    --collect-submodules winrt --collect-data zhconv `
+    --exclude-module tkinter --exclude-module uiautomation --exclude-module comtypes app.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 $ver = (Select-String -Path app.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
