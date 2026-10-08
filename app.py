@@ -42,7 +42,10 @@ DEFAULTS = {
     "color": "#ffffff", "highlight": "#1ed760",
     "locked": False, "second_line": True, "translation": True,
     "follow_button": True,  # show / hide together with Spotify's own lyrics button
-    "offsets": {},     # per-song timing offset in seconds; positive = lyrics earlier
+    # Timing offsets in seconds; positive = lyrics earlier. Lines are timed to when singing starts,
+    # so showing them a little early feels in sync.
+    "global_offset": 0.4,
+    "offsets": {},     # per song, on top of global_offset
     "tips_shown": [],  # one-time tray tips that were already shown
 }
 
@@ -136,7 +139,7 @@ class LyricsApp(QObject):
         return self.pos + (time.monotonic() - self.mono if self.playing else 0.0)
 
     def position(self) -> float:
-        return self.raw_position() + self.offset()
+        return self.raw_position() + self.settings["global_offset"] + self.offset()
 
     def _on_snapshot(self, snap: Snapshot):
         if snap.running != self.running:
@@ -270,6 +273,10 @@ class LyricsApp(QObject):
         add(m, "earlier", lambda: self.shift(+0.5))
         add(m, "later", lambda: self.shift(-0.5))
         add(m, "reset_offset", lambda: self.shift(None))
+        self.global_menu = m.addMenu("")
+        add(self.global_menu, "global_earlier", lambda: self.shift_global(+0.1))
+        add(self.global_menu, "global_later", lambda: self.shift_global(-0.1))
+        add(self.global_menu, "global_reset", lambda: self.shift_global(None))
         add(m, "research", lambda: self.fetch(use_cache=False))
         m.addSeparator()
 
@@ -317,6 +324,7 @@ class LyricsApp(QObject):
         self.act_trans.setChecked(s["translation"])
         self.act_second.setChecked(s["second_line"])
         self.act_offset.setText(tr("offset_now", offset=self.offset()))
+        self.global_menu.menuAction().setText(tr("global_offset", offset=s["global_offset"]))
         for code, a in self.act_langs.items():
             a.setChecked(code == s["language"])
         self.act_autostart.setChecked(_autostart_enabled())
@@ -368,6 +376,11 @@ class LyricsApp(QObject):
         else:
             offsets.pop(self.key, None)
         self.settings.save()
+
+    def shift_global(self, delta: float | None):
+        s = self.settings
+        s["global_offset"] = DEFAULTS["global_offset"] if delta is None else round(s["global_offset"] + delta, 2)
+        s.save()
 
     def change_font(self, delta: int):
         self.settings["font_size"] = max(14, min(96, self.settings["font_size"] + delta))
