@@ -72,6 +72,74 @@ def press_media_key(command: str):
     ctypes.windll.user32.keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP
 
 
+# Playback commands straight to Spotify's window: APPCOMMAND_MEDIA_PLAY_PAUSE / NEXTTRACK / PREVIOUSTRACK
+APP_COMMANDS = {"toggle": 14, "next": 11, "prev": 12}
+_u32 = ctypes.WinDLL("user32")
+_u32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM, wintypes.UINT,
+                                     wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+_u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_u32.IsWindowVisible.argtypes = [wintypes.HWND]
+_u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_k32.OpenProcess.restype = wintypes.HANDLE
+_k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                            ctypes.POINTER(wintypes.DWORD)]
+_EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def _process_name(hwnd) -> str:
+    pid = wintypes.DWORD()
+    _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    handle = _k32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        buf, size = ctypes.create_unicode_buffer(260), wintypes.DWORD(260)
+        ok = _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        return buf.value.rsplit("\\", 1)[-1].lower() if ok else ""
+    finally:
+        _k32.CloseHandle(handle)
+
+
+def app_window(exe: str) -> int:
+    """The app's main window (shown or minimized, with a title: Spotify's is the song), or 0. Only window titles
+    and classes are read: nothing goes through Spotify's UI."""
+    found = []
+
+    def check(hwnd, _):
+        cls = ctypes.create_unicode_buffer(64)
+        _u32.GetClassNameW(hwnd, cls, 64)
+        if cls.value == "Chrome_WidgetWin_1" and _u32.IsWindowVisible(hwnd) and _u32.GetWindowTextLengthW(hwnd) \
+                and _process_name(hwnd) == exe:
+            found.append(hwnd)
+            return False
+        return True
+
+    _u32.EnumWindows(_EnumProc(check), 0)
+    return found[0] if found else 0
+
+
+NOT_PLAYING_TITLES = {"Spotify", "Spotify Premium", "Spotify Free"}  # its window title when nothing plays
+_u32.IsWindow.argtypes = [wintypes.HWND]
+_u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+
+def window_says_playing(hwnd: int) -> bool | None:
+    """Whether Spotify's window title says it's playing: it's the song then ("Artist - Title"), and "Spotify
+    Premium" or the like when paused. None if there's no title to go by."""
+    title = ctypes.create_unicode_buffer(256)
+    if not hwnd or not _u32.IsWindow(hwnd) or not _u32.GetWindowTextW(hwnd, title, 256):
+        return None
+    return title.value.strip() not in NOT_PLAYING_TITLES
+
+
+def send_app_command(hwnd: int, command: str) -> bool:
+    """A playback command to the window, as the media keys of a keyboard aimed at it would send it."""
+    result = ctypes.c_size_t()
+    return bool(_u32.SendMessageTimeoutW(hwnd, 0x0319, hwnd, APP_COMMANDS[command] << 16,  # WM_APPCOMMAND
+                                         0x2, 1000, ctypes.byref(result)))  # SMTO_ABORTIFHUNG
+
+
 class MediaWatcher(threading.Thread):
     """Polls SMTC in the background and hands every sample to on_update as a Snapshot."""
 
@@ -88,6 +156,7 @@ class MediaWatcher(threading.Thread):
         self._session = None
         self._running = False
         self._running_checked = 0.0
+        self._window = 0  # Spotify's main window (see app_window)
 
     def run(self):
         while True:
@@ -99,12 +168,30 @@ class MediaWatcher(threading.Thread):
                 time.sleep(3)
 
     def send(self, command: str):
-        """Send a playback command from any thread: toggle / next / prev."""
-        if self._loop and self._session is not None:
+        """Send a playback command from any thread: toggle / next / prev. Straight to Spotify's window: through
+        Windows' media controls (SMTC), and through the media keys, Spotify sometimes ignores them, while SMTC
+        still reports success. SMTC (or the media keys) only if its window can't be found."""
+        hwnd = app_window(self._exe)
+        if hwnd and send_app_command(hwnd, command):
+            self._sample_soon(0.8)  # (Spotify reports the change to SMTC about 0.7 s later)
+        elif self._loop and self._session is not None:
             asyncio.run_coroutine_threadsafe(self._command(command), self._loop)
         else:
             # right after Spotify starts it has no SMTC session yet, so fall back to media keys
             press_media_key(command)
+
+    def _sample_soon(self, delay: float):
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        async def later():
+            await asyncio.sleep(delay)
+            self._wake.set()
+        try:
+            asyncio.run_coroutine_threadsafe(later(), loop)
+        except RuntimeError:  # the loop just closed (SMTC restarting)
+            pass
 
     async def _command(self, command: str):
         s = self._session
@@ -156,6 +243,12 @@ class MediaWatcher(threading.Thread):
         props = await session.try_get_media_properties_async()
         tl = session.get_timeline_properties()
         playing = session.get_playback_info().playback_status == PLAYING
+        # Spotify's playback status in SMTC can get stuck; its window title can't
+        if not _u32.IsWindow(self._window):
+            self._window = app_window(self._exe)
+        said = window_says_playing(self._window)
+        if said is not None:
+            playing = said
 
         # Spotify only updates `position` on play / pause / seek,
         # so while playing we extrapolate from last_updated_time.

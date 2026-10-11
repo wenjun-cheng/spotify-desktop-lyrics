@@ -27,7 +27,7 @@ import lyrics as lyr
 from i18n import tr
 from media import MediaWatcher, Snapshot, Track
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 ROOT = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller exe
 DATA = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyLyrics"  # settings, lyrics cache, log
@@ -91,6 +91,8 @@ class LyricsApp(QObject):
         self.lyrics: lyr.Lyrics | None = None
         self.status = "idle"  # idle | skip | loading | ok | none | error
         self.pos, self.mono, self.playing = 0.0, time.monotonic(), False
+        # after play / pause: (playing or not, until when) Spotify's report to SMTC may lag behind
+        self.expected: tuple[bool, float] | None = None
         # The overlay shows while Spotify is open. After the user hides it (tray icon, shortcut or the
         # close button), it stays hidden until it's toggled back on or Spotify is started again.
         self.running = False
@@ -166,7 +168,12 @@ class LyricsApp(QObject):
                 self.force_show = False
         self.sync_visibility()
 
-        self.pos, self.mono, self.playing = snap.position, snap.sampled_at, snap.playing
+        expected = self.expected
+        if expected and snap.playing != expected[0] and time.monotonic() < expected[1]:
+            pass  # just pressed play / pause and Spotify hasn't reported it yet (it takes ~0.7 s): keep it
+        else:
+            self.expected = None
+            self.pos, self.mono, self.playing = snap.position, snap.sampled_at, snap.playing
         track = snap.track
         key = lyr.track_key(track) if track else ""
         if key == self.key:
@@ -198,8 +205,10 @@ class LyricsApp(QObject):
     def control(self, command: str):
         """Playback control: toggle / next / prev."""
         if command == "toggle" and self.track:
-            # flip the icon right away; the next sample will correct it if needed
+            # flip the icon right away, and keep it while Spotify catches up (a sample that still has the old
+            # state would flip it back, and the button would seem not to work)
             self.pos, self.mono, self.playing = self.raw_position(), time.monotonic(), not self.playing
+            self.expected = (self.playing, time.monotonic() + 1.5)
         self.watcher.send(command)
 
     def hide_overlay(self):
